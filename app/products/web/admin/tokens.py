@@ -7,14 +7,18 @@ Performance notes:
   - Import refresh: reuses app.state.refresh_service singleton
 """
 
+from __future__ import annotations
+
 import asyncio
+import os
 import re
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, asdict
+from typing import TYPE_CHECKING, Any
 
 import orjson
 from fastapi import APIRouter, Body, Depends
 from fastapi.responses import Response
-from pydantic import BaseModel, RootModel
+from pydantic import BaseModel, Field, RootModel
 
 from app.platform.errors import AppError, ErrorKind, ValidationError
 from app.platform.logging.logger import logger
@@ -26,6 +30,11 @@ from app.control.account.commands import (
     ListAccountsQuery,
 )
 from app.control.account.enums import AccountStatus
+from app.control.account.xai_credentials import (
+    XaiCredentialExchangeError,
+    exchange_xai_credentials,
+    is_email,
+)
 
 if TYPE_CHECKING:
     from app.control.account.refresh import AccountRefreshService
@@ -60,6 +69,49 @@ def _mask(token: str) -> str:
     return f"{token[:8]}...{token[-8:]}" if len(token) > 20 else token
 
 
+def _mask_email(email: str) -> str:
+    local, _, domain = str(email or "").partition("@")
+    if not local or not domain:
+        return "<email>"
+    return f"{local[:1]}***@{domain[:1]}***"
+
+
+def _merge_tags(*groups: list[str]) -> list[str]:
+    seen: list[str] = []
+    for group in groups:
+        for raw in group or []:
+            tag = str(raw or "").strip()
+            if tag and tag not in seen:
+                seen.append(tag)
+    return seen
+
+
+def _parse_credential_line(value: str) -> tuple[str, str] | None:
+    line = str(value or "").strip()
+    if not line or line.startswith("#"):
+        return None
+    if "----" in line:
+        left, right, *_ = line.split("----")
+        email, password = left.strip(), right.strip()
+        return (email, password) if is_email(email) and password else None
+    parts = _CREDENTIAL_SPLIT_RE.split(line, maxsplit=1)
+    if len(parts) != 2:
+        return None
+    email, password = parts[0].strip(), parts[1].strip()
+    return (email, password) if is_email(email) and password else None
+
+
+def _failure_counts(failures: list["ImportFailure"]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for failure in failures:
+        counts[failure.reason] = counts.get(failure.reason, 0) + 1
+    return counts
+
+
+def _failure_payloads(failures: list["ImportFailure"]) -> list[dict[str, str]]:
+    return [asdict(failure) for failure in failures[:50]]
+
+
 # ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
@@ -70,8 +122,16 @@ class ReplacePoolRequest(BaseModel):
     tags: list[str] = []
 
 
+class TokenImportItem(BaseModel):
+    token: str = ""
+    email: str = ""
+    password: str = ""
+    tags: list[str] = []
+    ext: dict[str, Any] = Field(default_factory=dict)
+
+
 class AddTokensRequest(BaseModel):
-    tokens: list[str]
+    tokens: list[str | TokenImportItem]
     pool: str = "basic"
     tags: list[str] = []
 
@@ -92,13 +152,119 @@ class ToggleTokensDisabledRequest(BaseModel):
     disabled: bool
 
 
-class TokenImportItem(BaseModel):
-    token: str
-    tags: list[str] = []
-
-
 class SaveTokensRequest(RootModel[dict[str, list[str | TokenImportItem]]]):
     """Bulk-save payload keyed by pool name."""
+
+
+@dataclass(slots=True)
+class ImportFailure:
+    source: str
+    reason: str
+
+
+@dataclass(slots=True)
+class ResolvedImportItem:
+    token: str
+    tags: list[str]
+    ext: dict[str, Any]
+
+
+@dataclass(slots=True)
+class ImportResolution:
+    items: list[ResolvedImportItem]
+    failures: list[ImportFailure]
+
+
+_CREDENTIAL_SPLIT_RE = re.compile(r"\s+")
+
+
+def _import_item_from_raw(raw: str | TokenImportItem, inherited_tags: list[str]) -> tuple[str, str, list[str], dict[str, Any]] | ResolvedImportItem | None:
+    if isinstance(raw, str):
+        if parsed := _parse_credential_line(raw):
+            email, password = parsed
+            return email, password, list(inherited_tags or []), {}
+        token = _sanitize(raw)
+        return ResolvedImportItem(token=token, tags=list(inherited_tags or []), ext={}) if token else None
+
+    data = raw.model_dump()
+    tags = _merge_tags(inherited_tags, data.get("tags") or [])
+    ext = dict(data.get("ext") or {})
+
+    token = _sanitize(data.get("token", ""))
+    if token:
+        return ResolvedImportItem(token=token, tags=tags, ext=ext)
+
+    email = str(data.get("email") or "").strip()
+    password = str(data.get("password") or "")
+    if email or password:
+        return email, password, tags, ext
+    return None
+
+
+async def _resolve_import_items(
+    raw_items: list[str | TokenImportItem],
+    *,
+    tags: list[str] | None = None,
+) -> ImportResolution:
+    inherited_tags = list(tags or [])
+    direct: list[ResolvedImportItem] = []
+    credentials: list[tuple[str, str, list[str], dict[str, Any]]] = []
+    failures: list[ImportFailure] = []
+
+    for raw in raw_items:
+        item = _import_item_from_raw(raw, inherited_tags)
+        if item is None:
+            continue
+        if isinstance(item, ResolvedImportItem):
+            direct.append(item)
+            continue
+        email, password, item_tags, ext = item
+        if not is_email(email):
+            failures.append(ImportFailure(source=_mask_email(email), reason="invalid_email"))
+            continue
+        if not password:
+            failures.append(ImportFailure(source=_mask_email(email), reason="missing_password"))
+            continue
+        credentials.append((email, password, item_tags, ext))
+
+    if not credentials:
+        return ImportResolution(items=direct, failures=failures)
+
+    limit_raw = os.getenv("XAI_CREDENTIAL_IMPORT_CONCURRENCY", "2").strip()
+    try:
+        limit = max(1, min(10, int(limit_raw or "2")))
+    except ValueError:
+        limit = 2
+    semaphore = asyncio.Semaphore(limit)
+
+    async def _one(email: str, password: str, item_tags: list[str], ext: dict[str, Any]):
+        async with semaphore:
+            try:
+                result = await exchange_xai_credentials(email, password)
+            except XaiCredentialExchangeError as exc:
+                return None, ImportFailure(source=_mask_email(email), reason=exc.reason)
+            except Exception:
+                return None, ImportFailure(source=_mask_email(email), reason="network_error")
+            item_ext = dict(ext)
+            item_ext.setdefault("source_email", email)
+            item_ext.setdefault("credential_import", "xai_http")
+            item_ext.setdefault("credential_cookie", result.cookie_name)
+            return ResolvedImportItem(token=result.token, tags=item_tags, ext=item_ext), None
+
+    results = await asyncio.gather(*[_one(*credential) for credential in credentials])
+    for resolved, failure in results:
+        if resolved is not None:
+            direct.append(resolved)
+        if failure is not None:
+            failures.append(failure)
+
+    deduped: list[ResolvedImportItem] = []
+    seen: set[str] = set()
+    for item in direct:
+        if item.token and item.token not in seen:
+            seen.add(item.token)
+            deduped.append(item)
+    return ImportResolution(items=deduped, failures=failures)
 
 
 # ---------------------------------------------------------------------------
@@ -163,24 +329,39 @@ async def save_tokens(
     """Full pool replace — accepts {pool_name: [token_objects]} dict."""
     total_upserted = 0
     all_tokens: list[str] = []
+    failures: list[ImportFailure] = []
 
     for pool_name, items in req.root.items():
-        upserts = []
-        for item in items:
-            td = {"token": item} if isinstance(item, str) else item.model_dump()
-            token_val = _sanitize(td.get("token", ""))
-            if not token_val:
-                continue
-            upserts.append(AccountUpsert(token=token_val, pool=pool_name, tags=td.get("tags") or []))
+        resolved = await _resolve_import_items(items)
+        failures.extend(resolved.failures)
+        upserts = [
+            AccountUpsert(
+                token=item.token,
+                pool=pool_name,
+                tags=item.tags,
+                ext=item.ext,
+            )
+            for item in resolved.items
+        ]
         if upserts:
             await repo.replace_pool(BulkReplacePoolCommand(pool=pool_name, upserts=upserts))
             all_tokens.extend(u.token for u in upserts)
             total_upserted += len(upserts)
 
-    logger.info("admin tokens saved across pools: saved_count={}", total_upserted)
+    logger.info(
+        "admin tokens saved across pools: saved_count={} failed_count={}",
+        total_upserted,
+        len(failures),
+    )
     if all_tokens:
         asyncio.create_task(_refresh_imported(refresh_svc, all_tokens))
-    return _json({"status": "success", "count": total_upserted})
+    return _json({
+        "status": "success",
+        "count": total_upserted,
+        "failed": len(failures),
+        "failure_counts": _failure_counts(failures),
+        "failures": _failure_payloads(failures),
+    })
 
 
 @router.post("/tokens/add")
@@ -192,34 +373,56 @@ async def add_tokens(
     requested_pool = (req.pool or "basic").strip().lower()
     sync_auto_detect = requested_pool == "auto"
 
-    # Deduplicate and sanitize input
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for token in req.tokens:
-        tok = _sanitize(token)
-        if tok and tok not in seen:
-            seen.add(tok)
-            cleaned.append(tok)
-    if not cleaned:
+    resolved = await _resolve_import_items(req.tokens, tags=req.tags)
+    if not resolved.items and not resolved.failures:
         raise ValidationError("No valid tokens provided", param="tokens")
+    if not resolved.items:
+        return _json({
+            "status": "success",
+            "count": 0,
+            "skipped": 0,
+            "failed": len(resolved.failures),
+            "failure_counts": _failure_counts(resolved.failures),
+            "failures": _failure_payloads(resolved.failures),
+            "synced": False,
+        })
+    cleaned = [item.token for item in resolved.items]
 
     # Only upsert tokens that are not already active — avoids overwriting quota/status.
     # Soft-deleted tokens are treated as non-existing so they can be restored.
     existing = {r.token for r in await repo.get_accounts(cleaned) if not r.is_deleted()}
-    new_tokens = [t for t in cleaned if t not in existing]
+    new_items = [item for item in resolved.items if item.token not in existing]
 
-    if not new_tokens:
-        return _json({"status": "success", "count": 0, "skipped": len(cleaned)})
+    if not new_items:
+        return _json({
+            "status": "success",
+            "count": 0,
+            "skipped": len(cleaned),
+            "failed": len(resolved.failures),
+            "failure_counts": _failure_counts(resolved.failures),
+            "failures": _failure_payloads(resolved.failures),
+            "synced": False,
+        })
 
-    upserts = [AccountUpsert(token=t, pool=requested_pool, tags=req.tags) for t in new_tokens]
+    upserts = [
+        AccountUpsert(
+            token=item.token,
+            pool=requested_pool,
+            tags=item.tags,
+            ext=item.ext,
+        )
+        for item in new_items
+    ]
     result = await repo.upsert_accounts(upserts)
     logger.info(
-        "admin tokens added: pool={} added_count={} skipped_count={}",
+        "admin tokens added: pool={} added_count={} skipped_count={} failed_count={}",
         requested_pool,
-        len(new_tokens),
+        len(new_items),
         len(existing),
+        len(resolved.failures),
     )
 
+    new_tokens = [item.token for item in new_items]
     if sync_auto_detect:
         try:
             refresh_result = await refresh_svc.refresh_on_import(new_tokens)
@@ -236,6 +439,9 @@ async def add_tokens(
         "status": "success",
         "count": result.upserted or len(new_tokens),
         "skipped": len(existing),
+        "failed": len(resolved.failures),
+        "failure_counts": _failure_counts(resolved.failures),
+        "failures": _failure_payloads(resolved.failures),
         "synced": sync_auto_detect,
     })
 

@@ -1019,7 +1019,7 @@
   <div class="modal">
     <div class="modal-title" data-i18n="account.importTitle">导入文件</div>
     <div class="dialog-body">
-      <div class="dialog-help" id="import-file-hint" data-i18n="account.importHintDefault">支持 .txt（每行一个 Token）或 .json（{pool:[tokens]} 格式）</div>
+      <div class="dialog-help" id="import-file-hint" data-i18n="account.importHintDefault">支持 .txt（每行一个 Token，或邮箱+密码）或 .json（{pool:[tokens]} 格式）</div>
       <div class="dialog-field">
         <span class="dialog-label" data-i18n="account.labelFile">文件</span>
         <input class="import-file-input" id="import-file" type="file" accept=".txt,.json,text/plain,application/json" onchange="updateImportFileState()">
@@ -1670,10 +1670,26 @@ function openEdit(token) {
   openModal('modal-edit');
 }
 
+function parseImportLines(raw) {
+  const entries = [];
+  for (const lineRaw of String(raw || '').split(/\r?\n/)) {
+    const line = lineRaw.trim();
+    if (!line || line.startsWith('#')) continue;
+    let match = line.match(/^([^@\s]+@[^@\s]+\.[^@\s]+)----(.+)$/);
+    if (!match) match = line.match(/^([^@\s]+@[^@\s]+\.[^@\s]+)\s+(.+)$/);
+    if (match) {
+      entries.push({ email: match[1].trim(), password: match[2].trim() });
+    } else {
+      entries.push(line);
+    }
+  }
+  return entries;
+}
+
 async function doAdd() {
   const raw  = document.getElementById('import-tokens').value;
   const pool = document.getElementById('import-pool').value;
-  const newToks = raw.split('\n').map(s => s.trim()).filter(Boolean);
+  const newToks = parseImportLines(raw);
   if (!newToks.length) return showToast(tr('account.enterToken', null, '请输入 Token'), 'error');
   return saveTokens(
     pool,
@@ -1707,9 +1723,9 @@ async function doImport() {
       load();
     } catch (e) { showToast(`${tr('account.importFailed', null, '导入失败')}: ${e.message}`, 'error'); }
   } else {
-    // TXT 格式: 每行一个 token
+    // TXT 格式: 每行一个 token，或 email + password
     const pool = document.getElementById('import-file-pool').value;
-    const newToks = raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const newToks = parseImportLines(raw);
     if (!newToks.length) return showToast(tr('account.fileEmpty', null, '文件中没有可导入的 Token'), 'error');
     return saveTokens(
       pool,
@@ -1749,18 +1765,28 @@ function updateImportFileState() {
   if (poolRow) poolRow.style.display = isJson ? 'none' : '';
   if (hint) hint.textContent = isJson
     ? tr('account.importHintJson', null, 'JSON 文件已包含 pool 信息，无需选择类型')
-    : tr('account.importHintTxt', null, '每行一个 Token，将添加到所选类型');
+    : tr('account.importHintTxt', null, '每行一个 Token，或邮箱+密码；导入后将添加到所选类型');
 }
 
 async function saveTokens(pool, newToks, modalId, pendingMessage, successPrefix, errorPrefix) {
-  const unique = [...new Set(newToks)];
+  const seen = new Set();
+  const unique = [];
+  for (const item of newToks) {
+    const key = typeof item === 'string'
+      ? `token:${item}`
+      : `credential:${String(item.email || '').toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(item);
+  }
   try {
     showToast(pendingMessage, 'info');
     const d = await _api('POST', '/tokens/add', { pool, tokens: unique });
     closeModal(modalId);
-    const msg = d.skipped
+    let msg = d.skipped
       ? tr('account.saveResultSkipped', { prefix: successPrefix, count: d.count, skipped: d.skipped }, `${successPrefix}，新增 ${d.count}，已存在跳过 ${d.skipped}`)
       : tr('account.saveResult', { prefix: successPrefix, count: d.count }, `${successPrefix}，新增 ${d.count} 个`);
+    if (d.failed) msg += `，失败 ${d.failed}`;
     showToast(msg, 'success');
     load();
   } catch (e) { showToast(`${errorPrefix}: ${e.message}`, 'error'); }

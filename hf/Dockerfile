@@ -1,4 +1,4 @@
-FROM ghcr.io/chenyme/grok2api:latest
+FROM ghcr.io/xuanwoa/grok2api:latest
 
 ENV SERVER_HOST=0.0.0.0 \
     SERVER_PORT=7860 \
